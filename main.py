@@ -508,7 +508,7 @@ builder.add_edge("summarize",           END)
 # UI constants
 # ---------------------------------------------------------------------------
 
-MENU       = [("F1", "Chat"), ("F12", "Settings")]
+MENU       = [("F1", "Chat"), ("F5", "Compact"), ("F12", "Settings")]
 VIEW_HOME  = "home"
 VIEW_CHAT  = "chat"
 VIEW_SETTINGS = "settings"
@@ -547,6 +547,9 @@ class App:
         self._cancel_event  = threading.Event()
         self._ai_idx: int | None = None
         self._last_queue_event: float = 0.0
+        self._cancelling: bool = False
+        self._ignore_stream: bool = False
+        self._last_token_usage: dict = {}
         # Settings editor state
         self.settings_focus   = 0
         self.settings_bufs    = self._bufs_from_settings()
@@ -620,6 +623,9 @@ class App:
     def _handle_key(self, key) -> bool:
         if key == curses.KEY_F1:
             self.view = VIEW_CHAT
+        elif key == curses.KEY_F5:
+            if self.view == VIEW_CHAT and not self.thinking:
+                self._compact_context()
         elif key == curses.KEY_F12:
             self.prev_view        = self.view
             self.settings_bufs    = self._bufs_from_settings()
@@ -628,7 +634,12 @@ class App:
             self.view             = VIEW_SETTINGS
         elif key == 27:  # ESC
             if self.thinking:
-                self._cancel_event.set()
+                self._cancel_event.set()   # ask stream worker to stop after current call
+                self._ignore_stream = True # drop any events it puts in the queue
+                self._flush_queue()        # discard events already queued
+                self.thinking    = False   # immediately return UI to ready state
+                self._cancelling = False
+                self._ai_idx     = None
             elif self.view == VIEW_SETTINGS:
                 self._commit_settings()
                 self.view = self.prev_view
@@ -780,6 +791,14 @@ class App:
         self._draw_chat()
         self.stdscr.refresh()
 
+    def _flush_queue(self) -> None:
+        """Discard all pending events — called before starting a new stream."""
+        while True:
+            try:
+                self._stream_queue.get_nowait()
+            except queue.Empty:
+                break
+
     def _send(self):
         text = self.input_buf.strip()
         if not text:
@@ -788,11 +807,14 @@ class App:
         self.input_cursor = 0
         self.chat_scroll  = 0
         self.history.append(("user", text))
-        self.thinking  = True
-        self._log_lines = []
-        self._ai_idx    = None
+        self.thinking      = True
+        self._cancelling   = False
+        self._ignore_stream = False
+        self._log_lines    = []
+        self._ai_idx       = None
         self._last_queue_event = time.monotonic()
         self._cancel_event.clear()
+        self._flush_queue()
         self._start_log_thread()
         self._redraw()
         threading.Thread(target=self._stream_worker, args=(text,), daemon=True).start()
@@ -815,6 +837,20 @@ class App:
                     for node_name, update in data.items():
                         if node_name == "classify" and update.get("routing_note"):
                             q.put(("classify", update["routing_note"]))
+                        elif node_name in ("respond", "clarify"):
+                            for msg in update.get("messages", []):
+                                usage = getattr(msg, "usage_metadata", None)
+                                if not usage:
+                                    rm = getattr(msg, "response_metadata", {}) or {}
+                                    tu = rm.get("token_usage", {})
+                                    if tu:
+                                        usage = {
+                                            "input_tokens":  tu.get("prompt_tokens", 0),
+                                            "output_tokens": tu.get("completion_tokens", 0),
+                                            "total_tokens":  tu.get("total_tokens", 0),
+                                        }
+                                if usage:
+                                    q.put(("token_usage", dict(usage)))
                         elif node_name == "tools":
                             for msg in update.get("messages", []):
                                 q.put(("tool", getattr(msg, "name", "tool"), getattr(msg, "content", "")))
@@ -850,6 +886,9 @@ class App:
                 return
 
     def _drain_queue(self) -> None:
+        if self._ignore_stream:
+            self._flush_queue()
+            return
         needs_redraw = False
         while True:
             try:
@@ -886,15 +925,26 @@ class App:
                         self.history.pop(self._ai_idx)
                         self._ai_idx = None
                     needs_redraw = True
+            elif kind == "token_usage":
+                self._last_token_usage = event[1]
+                needs_redraw = True
+            elif kind == "compact_done":
+                self.thinking    = False
+                self._cancelling = False
+                self._ai_idx     = None
+                self.history.append(("router", f"[Context compacted — {event[1]:,} tokens freed]"))
+                needs_redraw = True
             elif kind == "done":
-                self.thinking = False
-                self._ai_idx  = None
-                needs_redraw  = True
+                self.thinking    = False
+                self._cancelling = False
+                self._ai_idx     = None
+                needs_redraw     = True
             elif kind == "error":
                 self.history.append(("router", f"[Error: {event[1]}]"))
-                self.thinking = False
-                self._ai_idx  = None
-                needs_redraw  = True
+                self.thinking    = False
+                self._cancelling = False
+                self._ai_idx     = None
+                needs_redraw     = True
         if needs_redraw:
             self.stdscr.erase()
             self._draw_menubar()
@@ -904,6 +954,55 @@ class App:
     # ------------------------------------------------------------------
     # Monitor / log background threads
     # ------------------------------------------------------------------
+
+    def _compact_context(self) -> None:
+        self.thinking       = True
+        self._cancelling    = False
+        self._ignore_stream = False
+        self._log_lines     = ["Compacting context..."]
+        self._last_queue_event = time.monotonic()
+        self._cancel_event.clear()
+        self._flush_queue()
+        self._redraw()
+        threading.Thread(target=self._compact_worker, daemon=True).start()
+        threading.Thread(target=self._stream_watchdog, daemon=True).start()
+
+    def _compact_worker(self) -> None:
+        q = self._stream_queue
+        try:
+            config = {"configurable": {"thread_id": self.thread_id}}
+            state  = self.graph.get_state(config=config)
+            messages = list(state.values.get("messages", []))
+            if not messages:
+                q.put(("compact_done", 0))
+                return
+
+            existing = state.values.get("summary", "")
+            prefix   = f"Previous summary:\n{existing}\n\nNew messages:\n" if existing else ""
+            history_text = "\n".join(
+                f"{m.__class__.__name__}: {getattr(m, 'content', '')}"
+                for m in messages
+            )
+            cfg      = SETTINGS["agent"]
+            response = get_llm(cfg["address"], streaming=False).invoke([
+                SystemMessage(content=SUMMARIZE_PROMPT),
+                HumanMessage(content=prefix + history_text),
+            ])
+            new_summary = response.content if isinstance(response.content, str) else ""
+
+            # Estimate tokens freed (rough character-based count)
+            freed = sum(len(getattr(m, "content", "") or "") for m in messages) // 4
+
+            self.graph.update_state(
+                config=config,
+                values={
+                    "summary":  new_summary,
+                    "messages": [RemoveMessage(id=m.id) for m in messages],
+                },
+            )
+            q.put(("compact_done", freed))
+        except Exception as exc:
+            q.put(("error", f"Compact failed: {exc}"))
 
     def _start_monitor_thread(self):
         def _poll_system():
@@ -1185,12 +1284,17 @@ class App:
                     pass
 
         if self.thinking:
-            display = self._log_lines[-INPUT_H:] if self._log_lines else ["thinking..."]
-            for li, log_text in enumerate(display):
+            log_display = self._log_lines[-(INPUT_H - 1):] if self._log_lines else ["thinking..."]
+            for li, log_text in enumerate(log_display):
                 try:
                     self.stdscr.addstr(input_top + li, 0, f"  {log_text.strip()}"[:w - 1])
                 except curses.error:
                     pass
+            hint = "  ESC: stop"
+            try:
+                self.stdscr.addstr(input_top + INPUT_H - 1, 0, hint[:w - 1], curses.color_pair(4))
+            except curses.error:
+                pass
             return
 
         vlines           = self._compute_visual_lines(self.input_buf, field_w)
@@ -1314,6 +1418,15 @@ class App:
                     lines.append(f"  {' '.join(parts)}"[:width])
                 if clock is not None:
                     lines.append(f"  {clock:.0f} MHz"[:width])
+
+        # Context token usage from last LLM call
+        usage = self._last_token_usage
+        if usage:
+            inp  = usage.get("input_tokens",  0)
+            out  = usage.get("output_tokens", 0)
+            lines.append("- context"[:width])
+            lines.append(f"  in:  {inp:,}"[:width])
+            lines.append(f"  out: {out:,}"[:width])
 
         return lines
 
