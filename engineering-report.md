@@ -70,6 +70,12 @@ Settings are stored in `settings.json` next to `main.py` and auto-created with d
 | `agent.cwd` | *(empty)* | Working directory for tools **and the Hybrid RAG corpus** |
 | `researcher.address` | `http://100.83.3.32:9090/v1` | Qwen endpoint for query rewriting + grounded RAG answers |
 | `researcher.system_prompt` | *(empty)* | Override for the researcher's system prompt |
+| `brave.api_key` | *(empty)* | Brave Search API token used by the researcher web-search path |
+| `brave.base_url` | `https://api.search.brave.com/res/v1/web/search` | Brave web search endpoint |
+| `brave.count` | `5` | Default number of Brave results to fetch for a research pass |
+| `brave.country` | `us` | Country hint sent to Brave Search |
+| `brave.search_lang` | `en` | Search-language hint sent to Brave Search |
+| `brave.safesearch` | `moderate` | SafeSearch mode sent to Brave Search |
 | `classifier.address` | `http://100.66.64.45:9091/v1` | OpenAI-compatible base URL for the classifier model |
 | `classifier.system_prompt` | *(empty)* | Override for the classifier's system prompt |
 
@@ -88,16 +94,20 @@ flowchart TD
     classify --> route{"**route()**\nconfidence?"}
 
     route -->|"conf < 0.65"| clarify
+    route -->|"web_needed"| web
     route -->|"rag_needed"| rag
     route -->|"respond"| respond
 
     clarify["**clarify**\nAsk one\nclarifying question"]
     clarify --> END1(["⏹ END"])
 
+    web["**web_research**\nQwen rewrites query\n→ Brave Search API\n→ researcher brief"]
+    web --> respond
+
     rag["**rag**\nQuery rewrite (Qwen)\n→ Hybrid retrieve (dense+BM25/RRF)\n→ rerank → small-to-big → compress"]
     rag --> respond
 
-    respond["**respond**\nrag_context? → Qwen (grounded)\nelse Agent LLM + tools\n+ domain system prompt"]
+    respond["**respond**\nrag_context? → Qwen (grounded)\nresearch_brief? → Agent + sourced brief\nelse Agent LLM + tools"]
 
     respond --> after{"**_after_respond()**\ntool calls?"}
 
@@ -134,12 +144,13 @@ The classifier has three layers of error recovery: JSON parse retry (up to 2 att
 A pure Python function reads the classification and picks the next node:
 
 - `confidence < 0.65` → ask a clarifying question, then stop
+- `web_needed == true` → **web_research node** (Qwen query rewrite → Brave Search → researcher brief), then respond
 - `rag_needed == true` → **RAG node** (Hybrid RAG: rewrite → retrieve → rerank → compress), then respond
 - Otherwise → respond directly
 
 ### Phase 3 — Respond
 
-The respond node has **two paths**. If the RAG node retrieved context, the **Qwen researcher** answers grounded strictly in that context (no tools). Otherwise the main **agent LLM** is called with a **domain-specific system prompt** and three bound tools; if it calls any, the tools run and the model is called again with the results.
+The respond node has **three paths**. If the RAG node retrieved context, the **Qwen researcher** answers grounded strictly in that context (no tools). If the web research node prepared a Brave-backed brief, the main agent receives that brief as sourced context before answering. Otherwise the main **agent LLM** is called with a **domain-specific system prompt** and three bound tools; if it calls any, the tools run and the model is called again with the results.
 
 ### Phase 4 — Summarise
 
@@ -156,6 +167,8 @@ When the total message count exceeds **40**, the oldest messages (everything exc
 | `launch_app` | Spawn a long-running detached process and return immediately | none |
 
 The `cwd` from settings is passed as the working directory for the first two tools.
+
+Brave web search is implemented as a LangChain tool for the researcher path, but it is not currently exposed to the main agent's general-purpose tool list.
 
 > **Windows note:** Long-running processes launched via `run_powershell` are killed using `taskkill /F /T` on timeout to clean up the full process tree.
 
@@ -239,7 +252,7 @@ rank-bm25                     # sparse keyword retrieval
 
 ## Known Limitations / Future Work
 
-- **`tools_needed`** from the classifier is captured in state but not currently used to filter which tools are offered to the agent.
+- **`tools_needed`** is now used to trigger Brave-backed web research when the classifier emits `web_search`.
 - **Hybrid RAG** is dense+sparse with RRF fusion and cross-encoder reranking; it does **not** yet use Qdrant-native sparse vectors or a parent-document store beyond the in-memory map. First query after a corpus change pays a one-time (re)index cost.
 - The monitor and log endpoints are hardcoded to `100.66.64.45:8086` but are overridable via the settings JSON if the key is added manually.
 - There is no authentication on the LLM endpoints — assumed to be running on a trusted local network.

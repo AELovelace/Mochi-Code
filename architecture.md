@@ -47,10 +47,14 @@ class AgentState(TypedDict, total=False):
                          # verifone | ai_runtime | finance | legal_hr
     confidence:   float  # 0.0–1.0 from classifier LLM
     rag_needed:   bool
+    web_needed:   bool
     tools_needed: list[str]
     routing_note: str    # human-readable routing debug string, shown in TUI
     summary:      str    # rolling compression of messages older than WINDOW_SIZE
     rag_context:  str    # retrieved + compressed context from rag.py (consumed by respond)
+    web_query:    str    # rewritten Brave query used by the web_research node
+    web_results:  list[dict]
+    research_brief: str  # concise Brave-backed brief handed to the main agent
 ```
 
 ---
@@ -62,9 +66,11 @@ flowchart TD
     START(["▶ START"]) --> classify
     classify --> route{"route()"}
     route -->|"conf < 0.65"| clarify
+    route -->|"web_needed"| web_research
     route -->|"rag_needed"| rag
     route -->|"respond"| respond
     clarify --> END1(["⏹ END"])
+    web_research --> respond
     rag --> respond
     respond --> after{"_after_respond()"}
     after -->|"tool_calls"| tools
@@ -81,9 +87,11 @@ flowchart TD
 |---|---|---|
 | START | — | classify |
 | classify | `confidence < CONFIDENCE_THRESHOLD (0.65)` | clarify |
+| classify | `web_needed == True` | web_research |
 | classify | `rag_needed == True` | rag |
 | classify | otherwise | respond |
 | clarify | — | END |
+| web_research | — | respond |
 | rag | — | respond || respond | `last message has tool_calls` | tools |
 | respond | `last message has <tool_call> XML` | dispatch_text_tools |
 | respond | otherwise | summarize |
@@ -133,7 +141,7 @@ class App:
     _stop_event     # threading.Event — stops monitor threads on exit
 
     # Settings editor
-    settings_focus   # int — currently focused field index (0–4)
+    settings_focus   # int — currently focused field index within settings_bufs
     settings_bufs    # list[str] — editable field buffers
     settings_cursors # list[int] — cursor positions per field
 
@@ -213,6 +221,14 @@ Hard fallback: intent=chat, domain=general, confidence=0.0 → route to respond
     "address":       "http://100.83.3.32:9090/v1",
     "system_prompt": ""
   },
+  "brave": {
+    "api_key":       "",
+    "base_url":      "https://api.search.brave.com/res/v1/web/search",
+    "count":         "5",
+    "country":       "us",
+    "search_lang":   "en",
+    "safesearch":    "moderate"
+  },
   "classifier": {
     "address":       "http://host:9091/v1",
     "system_prompt": ""
@@ -220,7 +236,7 @@ Hard fallback: intent=chat, domain=general, confidence=0.0 → route to respond
 }
 ```
 
-`load_settings()` deep-merges file values over `DEFAULT_SETTINGS`, so new keys added to defaults are always present even on older config files. The `researcher` section drives the Qwen endpoint used by the Hybrid RAG pipeline (query rewriting + grounded answer synthesis).
+`load_settings()` deep-merges file values over `DEFAULT_SETTINGS`, so new keys added to defaults are always present even on older config files. The `researcher` section drives the Qwen endpoint used by both the Hybrid RAG pipeline and the Brave-backed web research pipeline; the `brave` section holds the HTTP settings for the external search API.
 
 ---
 
