@@ -104,19 +104,60 @@ def _fallback_research_brief(results: list[dict]) -> str:
     return "Summary:\n" + "\n".join(summary_lines) + "\n\nSources:\n" + "\n".join(source_lines)
 
 
+_BROWSE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+}
+
+
 def _fetch_webpage(url: str, max_chars: int = 8000) -> str:
-    """Fetch a URL and return cleaned plain text, truncated to max_chars."""
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; SakuraLang/1.0)"},
-    )
+    """Fetch a URL and return cleaned plain text, truncated to max_chars.
+
+    Uses curl_cffi (Chrome TLS fingerprint) to bypass bot protection on sites
+    like Cloudflare-guarded pages; falls back to requests then urllib.
+    """
+    raw_html: bytes = b""
+    last_exc: Exception | None = None
+
+    # Tier 1: curl_cffi — impersonates Chrome's TLS fingerprint, bypasses most bot protection
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            raw_html = resp.read()
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"HTTP {exc.code}: {exc.reason}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Network error: {exc.reason}") from exc
+        from curl_cffi import requests as _cffi_requests
+        resp = _cffi_requests.get(url, impersonate="chrome", timeout=30)
+        resp.raise_for_status()
+        raw_html = resp.content
+    except ImportError:
+        last_exc = None  # not installed, try next tier
+    except Exception as exc:
+        last_exc = exc
+
+    # Tier 2: requests — better header/compression handling than urllib
+    if not raw_html:
+        try:
+            import requests as _requests
+            resp = _requests.get(url, headers=_BROWSE_HEADERS, timeout=30, allow_redirects=True)
+            resp.raise_for_status()
+            raw_html = resp.content
+        except Exception as exc:
+            last_exc = exc
+
+    # Tier 3: urllib stdlib fallback
+    if not raw_html:
+        try:
+            req = urllib.request.Request(url, headers=_BROWSE_HEADERS)
+            with urllib.request.urlopen(req, timeout=30) as r:
+                raw_html = r.read()
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"HTTP {e.code}: {e.reason}") from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Network error: {e.reason}") from e
+        except Exception as e:
+            raise RuntimeError(str(last_exc or e)) from e
 
     try:
         import trafilatura
@@ -139,6 +180,8 @@ def _fetch_webpage(url: str, max_chars: int = 8000) -> str:
         s.feed(raw_html.decode("utf-8", errors="replace"))
         text = " ".join(s.parts)
 
+    from security import sanitize_external
+    text = sanitize_external(text)
     return text[:max_chars]
 
 

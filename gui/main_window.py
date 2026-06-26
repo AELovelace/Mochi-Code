@@ -9,7 +9,7 @@ import threading
 import time
 import urllib.request
 
-from PyQt6.QtCore import QEvent, QObject, QThread, QTimer, Qt
+from PyQt6.QtCore import QEvent, QObject, QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QCloseEvent, QKeyEvent
 from PyQt6.QtWidgets import (
     QApplication,
@@ -45,11 +45,12 @@ from .monitor_widget import MonitorWidget
 
 # Role → (display label, accent colour, bubble colour, border colour)
 _ROLE_STYLES: dict[str, tuple[str, str, str, str]] = {
-    "user":    ("You",       "#a83255", "#fce4ec", "#f48fb1"),
-    "ai":      ("Sakura",   "#2a5f96", "#e3f2fd", "#90caf9"),
-    "tool":    ("Tool",      "#b45309", "#fef3c7", "#fcd34d"),
-    "rag":     ("Documents", "#2d7045", "#e8f5e9", "#a5d6a7"),
-    "router":  ("System",    "#6a4a72", "#ede6ee", "#c8b0d0"),
+    "user":       ("You",       "#a83255", "#fce4ec", "#f48fb1"),
+    "ai":         ("Sakura",   "#2a5f96", "#e3f2fd", "#90caf9"),
+    "tool":       ("Tool",      "#b45309", "#fef3c7", "#fcd34d"),
+    "rag":        ("Documents", "#2d7045", "#e8f5e9", "#a5d6a7"),
+    "router":     ("System",    "#6a4a72", "#ede6ee", "#c8b0d0"),
+    "lovense_qr": ("Lovense",   "#7b1fa2", "#f3e5f5", "#ce93d8"),
 }
 
 _MODES = ["auto", "agent", "plan", "chat"]
@@ -74,6 +75,9 @@ class _ComposerKeyFilter(QObject):
 
 
 class MainWindow(QMainWindow):
+    _lv_msg = pyqtSignal(str)   # thread-safe channel for lovense text results
+    _lv_qr  = pyqtSignal(str)  # thread-safe channel for lovense QR HTML
+
     def __init__(self, graph, db_path: str = "chat_history.db") -> None:
         super().__init__()
         self.graph = graph
@@ -85,6 +89,11 @@ class MainWindow(QMainWindow):
         self._ai_idx: int | None = None
         self.thinking = False
         self._last_token_usage: dict = {}
+
+        # Lovense heat state — persists between messages until next heat tag
+        self._current_heat: float = 0.0
+        self._lv_msg.connect(lambda msg: self._handle_event(("lovense_msg", msg)))
+        self._lv_qr.connect(lambda html: self._handle_event(("lovense_qr", html)))
 
         # Worker handles
         self._stream_thread: QThread | None = None
@@ -206,6 +215,7 @@ class MainWindow(QMainWindow):
         self._transcript = QTextBrowser()
         self._transcript.setObjectName("chatTranscript")
         self._transcript.setOpenExternalLinks(False)
+        self._transcript.setOpenLinks(False)
         self._transcript.setFrameShape(QFrame.Shape.NoFrame)
         self._transcript.document().setDocumentMargin(8)
         chat_layout.addWidget(self._transcript, 1)
@@ -782,13 +792,6 @@ class MainWindow(QMainWindow):
         self._send_btn.setEnabled(False)
         self.statusBar().showMessage("Generating response…")
 
-        try:
-            import lovense as _lv
-            if _lv.is_connected():
-                _lv.activate()
-        except Exception:
-            pass
-
         worker = StreamWorker(self.graph, self.thread_id, text, self._cancel_event)
         thread = QThread(self)
         worker.moveToThread(thread)
@@ -800,6 +803,20 @@ class MainWindow(QMainWindow):
         self._stream_worker = worker
         thread.start()
 
+    def _apply_heat(self, level: float) -> None:
+        """Drive the Lovense toy to the given heat level (0.0–1.0, persistent)."""
+        self._current_heat = level
+        try:
+            import lovense as _lv
+            if not _lv.is_connected():
+                return
+            if level == 0.0:
+                _lv.deactivate()
+            else:
+                _lv.activate(strength=round(level * 20), duration_sec=0)
+        except Exception:
+            pass
+
     def _cancel_stream(self):
         self._cancel_event.set()
         self.thinking = False
@@ -809,11 +826,7 @@ class MainWindow(QMainWindow):
         self._send_btn.setEnabled(True)
         self._composer.setFocus()
         self.statusBar().showMessage("Cancelled.")
-        try:
-            import lovense as _lv
-            _lv.deactivate()
-        except Exception:
-            pass
+        self._apply_heat(0.0)
 
     # ── Event dispatch ────────────────────────────────────────────────────
 
@@ -864,9 +877,11 @@ class MainWindow(QMainWindow):
             if self._ai_idx is not None:
                 role, prev = self.history[self._ai_idx]
                 from tools import TOOL_MAP
+                from prompts import HEAT_TAG_RE
                 cleaned = re.sub(r"<tool_call>.*?</tool_call>", "", prev, flags=re.DOTALL).strip()
                 tool_names = "|".join(sorted(re.escape(n) for n in TOOL_MAP))
                 cleaned = re.sub(rf"(?mis)^\s*(?:{tool_names})\s*\(.*\)\s*$", "", cleaned).strip()
+                cleaned = HEAT_TAG_RE.sub("", cleaned).strip()
                 if cleaned:
                     self.history[self._ai_idx] = (role, cleaned)
                 else:
@@ -931,11 +946,20 @@ class MainWindow(QMainWindow):
             self._composer.setFocus()
             self._ai_idx = None
             self.statusBar().showMessage("Response complete.")
-            try:
-                import lovense as _lv
-                _lv.deactivate()
-            except Exception:
-                pass
+            from prompts import HEAT_TAG_RE
+            last_heat = None
+            for role, text in reversed(self.history):
+                if role == "ai":
+                    matches = HEAT_TAG_RE.findall(text)
+                    if matches:
+                        last_heat = float(matches[-1])
+                    break
+            self._apply_heat(last_heat if last_heat is not None else 0.0)
+            self.history = [
+                (r, HEAT_TAG_RE.sub("", t).strip()) if r == "ai" else (r, t)
+                for r, t in self.history
+            ]
+            self._render_history()
             self._schedule_title_refresh(self.thread_id)
             self._refresh_thread_list()
 
@@ -952,20 +976,23 @@ class MainWindow(QMainWindow):
             self._ai_idx = None
             self._render_history()
             self.statusBar().showMessage(f"Error: {msg[:80]}")
-            try:
-                import lovense as _lv
-                _lv.deactivate()
-            except Exception:
-                pass
+            self._apply_heat(0.0)
 
         elif kind == "tool_approval_needed":
             _, tool_name, tool_args = event
+            pre_heat = self._current_heat
+            self._apply_heat(1.0)
             dialog = ToolApprovalDialog(tool_name, tool_args, self)
             dialog.exec()
             approval.resolve(dialog.result_approved())
+            self._apply_heat(pre_heat)
 
         elif kind == "lovense_msg":
             self.history.append(("router", event[1]))
+            self._render_history()
+
+        elif kind == "lovense_qr":
+            self.history.append(("lovense_qr", event[1]))
             self._render_history()
 
         elif kind == "title_done":
@@ -982,7 +1009,11 @@ class MainWindow(QMainWindow):
                 role,
                 (role.title(), "#2a5f96", "#e3f2fd", "#90caf9"),
             )
-            safe = self._render_markdown(text.strip() or "[Empty]")
+            # lovense_qr entries are already sanitized HTML (base64 img); skip escaping.
+            if role == "lovense_qr":
+                safe = text
+            else:
+                safe = self._render_markdown(text.strip() or "[Empty]")
             blocks.append(
                 f'<div style="background:{bubble};border:1px solid {border};'
                 f'border-radius:22px;padding:14px 18px;margin-bottom:10px;">'
@@ -1046,7 +1077,7 @@ class MainWindow(QMainWindow):
                     "[Lovense] No dev token or UID set — open Settings → Lovense."))
                 self._render_history()
                 return
-            import threading as _th
+            import threading as _th, tempfile as _tmp, os as _os, ssl as _ssl
             def _worker():
                 try:
                     resolved = host or _lv.get_local_ip()
@@ -1055,16 +1086,42 @@ class MainWindow(QMainWindow):
                     proto = "https" if cert and key else "http"
                     cb = f"{proto}://{resolved}:{port}/"
                     data = _lv.get_qr(token, uid, cb)
-                    qr = data.get("qr", "")
+                    qr_url = data.get("qr", "")
                     code = data.get("code", "")
-                    msg = (
-                        f"[Lovense] QR code ready!\n"
-                        f"Open this URL and scan with Lovense Remote:\n  {qr}\n"
-                        f"PC pairing code: {code}"
-                    )
+                    # Fetch the QR image and save to a temp file.
+                    # QTextBrowser supports file:// URLs but not data: URIs or https://.
+                    # Use the same User-Agent as lovense.py to bypass Cloudflare.
+                    try:
+                        ext = "." + qr_url.rsplit(".", 1)[-1].split("?")[0] if "." in qr_url else ".png"
+                        req = urllib.request.Request(
+                            qr_url,
+                            headers={"User-Agent": (
+                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                "Chrome/125.0.0.0 Safari/537.36"
+                            )},
+                        )
+                        ctx = _ssl.create_default_context()
+                        with urllib.request.urlopen(req, timeout=10, context=ctx) as r:
+                            img_bytes = r.read()
+                        fd, tmp_path = _tmp.mkstemp(suffix=ext)
+                        with _os.fdopen(fd, "wb") as f:
+                            f.write(img_bytes)
+                        file_url = tmp_path.replace("\\", "/")
+                        html = (
+                            f'<img src="file:///{file_url}" width="220" height="220" />'
+                            f'<br>Scan with <b>Lovense Remote</b> on your phone.'
+                            f'<br>PC pairing code: <b>{code}</b>'
+                        )
+                        self._lv_qr.emit(html)
+                    except Exception as img_err:
+                        self._lv_msg.emit(
+                            f"[Lovense] QR ready (image load failed: {img_err})\n"
+                            f"Open in browser and scan:\n  {qr_url}\n"
+                            f"PC pairing code: {code}"
+                        )
                 except Exception as exc:
-                    msg = f"[Lovense] QR request failed: {exc}"
-                self._handle_event(("lovense_msg", msg))
+                    self._lv_msg.emit(f"[Lovense] QR request failed: {exc}")
             _th.Thread(target=_worker, daemon=True).start()
             self.history.append(("router", "[Lovense] Requesting QR code…"))
         elif subcmd == "test":

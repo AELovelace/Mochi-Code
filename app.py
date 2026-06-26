@@ -90,6 +90,7 @@ class App:
         self._select_anchor: int | None = None
         self._select_lines:  list      = []   # rendered (pair, text) lines cached by _draw_chat
         self._approval_pending: dict | None = None   # set when agent mode needs tool approval
+        self._current_heat: float = 0.0
         self._db_path = "chat_history.db"
         self._ensure_chat_titles_table()
 
@@ -235,7 +236,8 @@ class App:
 
     @staticmethod
     def _normalize_chat_title(title: str) -> str:
-        cleaned = re.sub(r"\s+", " ", title or "").strip().strip("\"'`")
+        from prompts import HEAT_TAG_RE
+        cleaned = HEAT_TAG_RE.sub("", re.sub(r"\s+", " ", title or "")).strip().strip("\"'`")
         cleaned = cleaned.splitlines()[0].strip() if cleaned else ""
         cleaned = re.sub(r"[.!?:;,]+$", "", cleaned)
         if len(cleaned) > 60:
@@ -244,6 +246,7 @@ class App:
         return cleaned
 
     def _build_chat_title_source(self, thread_id: str, limit: int = 3) -> str:
+        from prompts import HEAT_TAG_RE
         try:
             config = {"configurable": {"thread_id": thread_id}}
             state = self.graph.get_state(config)
@@ -256,6 +259,7 @@ class App:
             content = getattr(msg, "content", "") or ""
             if not isinstance(content, str):
                 continue
+            content = HEAT_TAG_RE.sub("", content)
             snippet = re.sub(r"\s+", " ", content).strip()
             if not snippet:
                 continue
@@ -411,10 +415,13 @@ class App:
         if self._approval_pending is not None:
             if key in (ord('y'), ord('Y')):
                 approval.resolve(True)
-                self._approval_pending = None
             elif key in (ord('n'), ord('N'), 27):
                 approval.resolve(False)
-                self._approval_pending = None
+            else:
+                return True
+            pre_heat = self._approval_pending.get("pre_heat", 0.0)
+            self._approval_pending = None
+            self._apply_heat(pre_heat)
             return True
         if self.view == VIEW_CHAT and not self.thinking and not self._select_mode and key == 27:
             if self._handle_chat_escape_sequence():
@@ -1148,6 +1155,20 @@ class App:
         except Exception as exc:
             self.history.append(("router", f"[Lovense] Test failed: {exc}"))
 
+    def _apply_heat(self, level: float) -> None:
+        """Drive the Lovense toy to the given heat level (0.0–1.0, persistent)."""
+        self._current_heat = level
+        try:
+            import lovense as _lv
+            if not _lv.is_connected():
+                return
+            if level == 0.0:
+                _lv.deactivate()
+            else:
+                _lv.activate(strength=round(level * 20), duration_sec=0)
+        except Exception:
+            pass
+
     def _lovense_stop(self) -> None:
         """Send a stop command immediately."""
         try:
@@ -1369,15 +1390,6 @@ class App:
                 self.history.append(("ai", event[1]))
                 self._ai_idx = len(self.history) - 1
                 needs_redraw = True
-                # Activate the Lovense toy when the AI starts its response.
-                # We only activate on the very first ai_start (when _ai_idx was
-                # None before) to avoid re-triggering on multi-segment responses.
-                try:
-                    import lovense as _lv
-                    if _lv.is_connected():
-                        _lv.activate()
-                except Exception:
-                    pass
             elif kind == "ai_append":
                 if self._ai_idx is not None:
                     role, prev = self.history[self._ai_idx]
@@ -1388,9 +1400,11 @@ class App:
             elif kind == "ai_strip_tool_calls":
                 if self._ai_idx is not None:
                     role, prev = self.history[self._ai_idx]
+                    from prompts import HEAT_TAG_RE
                     cleaned = re.sub(r"<tool_call>.*?</tool_call>", "", prev, flags=re.DOTALL).strip()
                     tool_names = "|".join(sorted(re.escape(name) for name in TOOL_MAP))
                     cleaned = re.sub(rf"(?mis)^\s*(?:{tool_names})\s*\(.*\)\s*$", "", cleaned).strip()
+                    cleaned = HEAT_TAG_RE.sub("", cleaned).strip()
                     if cleaned:
                         self.history[self._ai_idx] = (role, cleaned)
                     else:
@@ -1442,12 +1456,19 @@ class App:
                 self._cancelling = False
                 self._ai_idx     = None
                 needs_redraw     = True
-                # Stop the toy when the AI finishes its full response.
-                try:
-                    import lovense as _lv
-                    _lv.deactivate()
-                except Exception:
-                    pass
+                from prompts import HEAT_TAG_RE
+                last_heat = None
+                for role, text in reversed(self.history):
+                    if role == "ai":
+                        matches = HEAT_TAG_RE.findall(text)
+                        if matches:
+                            last_heat = float(matches[-1])
+                        break
+                self._apply_heat(last_heat if last_heat is not None else 0.0)
+                self.history = [
+                    (r, HEAT_TAG_RE.sub("", t).strip()) if r == "ai" else (r, t)
+                    for r, t in self.history
+                ]
                 if self._active_request_thread_id:
                     self._schedule_chat_title_refresh(self._active_request_thread_id)
                     self._active_request_thread_id = None
@@ -1459,15 +1480,12 @@ class App:
                 self._ai_idx     = None
                 self._active_request_thread_id = None
                 needs_redraw     = True
-                # Also stop the toy on errors so it doesn't run indefinitely.
-                try:
-                    import lovense as _lv
-                    _lv.deactivate()
-                except Exception:
-                    pass
+                self._apply_heat(0.0)
             elif kind == "tool_approval_needed":
                 _, tool_name, tool_args = event
-                self._approval_pending = {"name": tool_name, "args": tool_args}
+                pre_heat = self._current_heat
+                self._apply_heat(1.0)
+                self._approval_pending = {"name": tool_name, "args": tool_args, "pre_heat": pre_heat}
                 needs_redraw = True
             elif kind == "lovense_msg":
                 # Result from _lovense_connect() running off the UI thread.

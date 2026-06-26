@@ -265,11 +265,13 @@ class TitleWorker(QObject):
         except Exception:
             return
 
+        from prompts import HEAT_TAG_RE
         lines = []
         for msg in messages[-3:]:
             content = getattr(msg, "content", "") or ""
             if not isinstance(content, str):
                 continue
+            content = HEAT_TAG_RE.sub("", content)
             snippet = re.sub(r"\s+", " ", content).strip()[:280]
             if not snippet:
                 continue
@@ -282,26 +284,34 @@ class TitleWorker(QObject):
 
         tcfg = SETTINGS.get("titler", {})
         address = tcfg.get("address", "").strip()
-        if not address:
-            return
 
         prompt = tcfg.get("system_prompt", "").strip() or CHAT_TITLE_PROMPT
-        try:
-            response = get_llm(address, streaming=False, timeout=45).invoke([
-                SystemMessage(content=prompt),
-                HumanMessage(content=source),
-            ])
-            raw = response.content if isinstance(response.content, str) else ""
-        except Exception:
-            return
+        raw = ""
+        if address:
+            try:
+                response = get_llm(address, streaming=False, timeout=45).invoke([
+                    SystemMessage(content=prompt),
+                    HumanMessage(content=source),
+                ])
+                raw = response.content if isinstance(response.content, str) else ""
+            except Exception:
+                pass
 
-        cleaned = re.sub(r"\s+", " ", raw or "").strip().strip("\"'`")
-        cleaned = cleaned.splitlines()[0].strip() if cleaned else ""
-        cleaned = re.sub(r"[.!?:;,]+$", "", cleaned)
-        if len(cleaned) > 60:
-            clipped = cleaned[:60].rsplit(" ", 1)[0].strip()
-            cleaned = clipped or cleaned[:60].strip()
+        def _clean(s: str) -> str:
+            s = HEAT_TAG_RE.sub("", re.sub(r"\s+", " ", s or "")).strip().strip("\"'`")
+            s = s.splitlines()[0].strip() if s else ""
+            s = re.sub(r"[.!?:;,]+$", "", s)
+            if len(s) > 60:
+                clipped = s[:60].rsplit(" ", 1)[0].strip()
+                s = clipped or s[:60].strip()
+            return s
 
+        cleaned = _clean(raw)
+        if not cleaned:
+            # Fall back to the first human message snippet
+            human_lines = [l.split(": ", 1)[1] for l in source.splitlines() if l.startswith("User:")]
+            if human_lines:
+                cleaned = _clean(human_lines[0])
         if not cleaned:
             return
         self.event_ready.emit(("title_done", self.thread_id, cleaned))
