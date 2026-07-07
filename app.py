@@ -44,6 +44,8 @@ from prompts import (
     F_LOVENSE_TOKEN, F_LOVENSE_UID, F_LOVENSE_PORT, F_LOVENSE_HOST,
     F_LOVENSE_CERT, F_LOVENSE_KEY,
     F_LOVENSE_HEAT_TOY, F_LOVENSE_REWARD_TOY,
+    F_RAG_DEVICE, F_RAG_EMBED_MODEL, F_RAG_RERANK_MODEL,
+    F_RAG_BATCH_SIZE, F_RAG_TOP_K_RETRIEVE, F_RAG_TOP_K_RERANK,
     NUM_FIELDS,
 )
 import approval
@@ -100,9 +102,11 @@ class App:
         self._ensure_chat_titles_table()
 
     def _bufs_from_settings(self) -> list[str]:
-        lv = SETTINGS.get("lovense", {})
+        lv  = SETTINGS.get("lovense", {})
         brave = SETTINGS.get("brave", {})
         titler = SETTINGS.get("titler", {})
+        rg  = SETTINGS.get("rag", {})
+        df_rg = DEFAULT_SETTINGS["rag"]
         return [
             SETTINGS["agent"]["address"],
             SETTINGS["agent"]["system_prompt"],
@@ -128,6 +132,13 @@ class App:
             lv.get("key_file",  ""),
             lv.get("heat_toy",   ""),
             lv.get("reward_toy", ""),
+            # RAG fields
+            rg.get("device",          df_rg["device"]),
+            rg.get("embedding_model", df_rg["embedding_model"]),
+            rg.get("reranker_model",  df_rg["reranker_model"]),
+            str(rg.get("batch_size",      df_rg["batch_size"])),
+            str(rg.get("top_k_retrieve",  df_rg["top_k_retrieve"])),
+            str(rg.get("top_k_rerank",    df_rg["top_k_rerank"])),
         ]
 
     def _new_thread_id(self) -> str:
@@ -644,6 +655,16 @@ class App:
         SETTINGS["lovense"]["key_file"]      = self.settings_bufs[F_LOVENSE_KEY]
         SETTINGS["lovense"]["heat_toy"]      = self.settings_bufs[F_LOVENSE_HEAT_TOY]
         SETTINGS["lovense"]["reward_toy"]    = self.settings_bufs[F_LOVENSE_REWARD_TOY]
+        SETTINGS.setdefault("rag", {})
+        SETTINGS["rag"]["device"]          = self.settings_bufs[F_RAG_DEVICE]
+        SETTINGS["rag"]["embedding_model"] = self.settings_bufs[F_RAG_EMBED_MODEL]
+        SETTINGS["rag"]["reranker_model"]  = self.settings_bufs[F_RAG_RERANK_MODEL]
+        try:
+            SETTINGS["rag"]["batch_size"]      = int(self.settings_bufs[F_RAG_BATCH_SIZE] or 32)
+            SETTINGS["rag"]["top_k_retrieve"]  = int(self.settings_bufs[F_RAG_TOP_K_RETRIEVE] or 20)
+            SETTINGS["rag"]["top_k_rerank"]    = int(self.settings_bufs[F_RAG_TOP_K_RERANK] or 5)
+        except ValueError:
+            pass
         save_settings(SETTINGS)
         rebuild_llms()
         # Also restart the callback server with updated cert/key if port changed.
@@ -2036,6 +2057,24 @@ class App:
         self._draw_field(y, "  Heat Toy ID:   ", F_LOVENSE_HEAT_TOY,  LABEL_W, field_w, multiline=False)
         y += 2
         self._draw_field(y, "  Reward Toy ID: ", F_LOVENSE_REWARD_TOY, LABEL_W, field_w, multiline=False)
+        y += 2
+
+        # RAG pipeline tuning — device, models, batch size, retrieval limits.
+        # Change embedding_model only if you want a different vector space; it will
+        # force a full index rebuild on the next RAG query (index is invalidated automatically).
+        _header(y, "RAG (retrieval pipeline)")
+        y += 2
+        self._draw_field(y, "  Device:        ", F_RAG_DEVICE,        LABEL_W, field_w, multiline=False)
+        y += 2
+        self._draw_field(y, "  Embed Model:   ", F_RAG_EMBED_MODEL,   LABEL_W, field_w, multiline=False)
+        y += 2
+        self._draw_field(y, "  Rerank Model:  ", F_RAG_RERANK_MODEL,  LABEL_W, field_w, multiline=False)
+        y += 2
+        self._draw_field(y, "  Batch Size:    ", F_RAG_BATCH_SIZE,    LABEL_W, field_w, multiline=False)
+        y += 2
+        self._draw_field(y, "  Top-K Retrieve:", F_RAG_TOP_K_RETRIEVE,LABEL_W, field_w, multiline=False)
+        y += 2
+        self._draw_field(y, "  Top-K Rerank:  ", F_RAG_TOP_K_RERANK,  LABEL_W, field_w, multiline=False)
         y += 2
 
         footer = "  Tab: field   ↑↓ (prompt): line / (addr): field   ←→/Home/End: cursor   Enter: newline   ESC: save"

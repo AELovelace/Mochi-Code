@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import threading
 import time
 import urllib.request
 
-from PyQt6.QtCore import QEvent, QObject, QThread, QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QAction, QCloseEvent, QKeyEvent
+from PyQt6.QtCore import QDir, QEvent, QObject, QThread, QTimer, Qt, pyqtSignal
+from PyQt6.QtGui import QAction, QCloseEvent, QFileSystemModel, QKeyEvent
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -25,8 +26,10 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QSplitter,
     QStatusBar,
+    QTabWidget,
     QTextBrowser,
     QToolBar,
+    QTreeView,
     QVBoxLayout,
     QWidget,
 )
@@ -43,11 +46,13 @@ from .tools_dialog import ToolApprovalDialog
 from .settings_dialog import SettingsDialog
 from .chat_list_dialog import ChatListDialog
 from .monitor_widget import MonitorWidget
+from .editor_support import resolve_explorer_root
+from .editor_window import EditorWindow
 
 # Role → (display label, accent colour, bubble colour, border colour)
 _ROLE_STYLES: dict[str, tuple[str, str, str, str]] = {
     "user":       ("You",       "#a83255", "#fce4ec", "#f48fb1"),
-    "ai":         ("Sakura",   "#2a5f96", "#e3f2fd", "#90caf9"),
+    "ai":         ("Mochi",    "#2a5f96", "#e3f2fd", "#90caf9"),
     "tool":       ("Tool",      "#b45309", "#fef3c7", "#fcd34d"),
     "rag":        ("Documents", "#2d7045", "#e8f5e9", "#a5d6a7"),
     "router":     ("System",    "#6a4a72", "#ede6ee", "#c8b0d0"),
@@ -111,6 +116,7 @@ class MainWindow(QMainWindow):
         self._agent_log_lines:      list[str] = []
         self._researcher_log_lines: list[str] = []
         self._log_stop = threading.Event()
+        self._editor_windows: list[EditorWindow] = []
 
         self.setWindowTitle("SakuraLang")
         self.resize(1280, 800)
@@ -132,6 +138,47 @@ class MainWindow(QMainWindow):
             self.thread_id = self._new_thread_id()
         self._refresh_thread_list()
         self._refresh_status()
+
+    def _refresh_file_tree_root(self):
+        root = resolve_explorer_root(
+            SETTINGS.get("agent", {}).get("cwd", ""),
+            os.getcwd(),
+        )
+        self._file_root_label.setText(root)
+        root_index = self._file_model.setRootPath(root)
+        self._file_tree.setRootIndex(root_index)
+        self._file_tree.sortByColumn(0, Qt.SortOrder.AscendingOrder)
+
+    def _track_editor_window(self, window: EditorWindow):
+        self._editor_windows.append(window)
+        window.destroyed.connect(
+            lambda _obj=None, ref=window: self._release_editor_window(ref)
+        )
+
+    def _release_editor_window(self, window: EditorWindow):
+        self._editor_windows = [w for w in self._editor_windows if w is not window]
+
+    def open_new_editor(self):
+        window = EditorWindow()
+        self._track_editor_window(window)
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def _open_file_from_index(self, index):
+        if not index.isValid() or self._file_model.isDir(index):
+            return
+
+        path = self._file_model.filePath(index)
+        window = EditorWindow()
+        self._track_editor_window(window)
+        if not window.load_path(path):
+            self._release_editor_window(window)
+            window.deleteLater()
+            return
+        window.show()
+        window.raise_()
+        window.activateWindow()
 
     def _new_thread_id(self) -> str:
         return f"chat_{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns() % 1_000_000:06d}"
@@ -160,6 +207,10 @@ class MainWindow(QMainWindow):
         settings_action = QAction("Settings", self)
         settings_action.triggered.connect(self.open_settings)
         toolbar.addAction(settings_action)
+
+        editor_action = QAction("New Editor", self)
+        editor_action.triggered.connect(self.open_new_editor)
+        toolbar.addAction(editor_action)
 
         toolbar.addSeparator()
 
@@ -199,10 +250,48 @@ class MainWindow(QMainWindow):
         self._new_btn.clicked.connect(self.create_new_chat)
         sidebar_layout.addWidget(self._new_btn)
 
+        self._sidebar_tabs = QTabWidget()
+        self._sidebar_tabs.setObjectName("sidebarTabs")
+        sidebar_layout.addWidget(self._sidebar_tabs, 1)
+
+        chats_tab = QWidget()
+        chats_layout = QVBoxLayout(chats_tab)
+        chats_layout.setContentsMargins(0, 0, 0, 0)
+        chats_layout.setSpacing(0)
+
         self._thread_list = QListWidget()
         self._thread_list.setObjectName("conversationList")
         self._thread_list.itemClicked.connect(self._on_thread_clicked)
-        sidebar_layout.addWidget(self._thread_list, 1)
+        chats_layout.addWidget(self._thread_list, 1)
+        self._sidebar_tabs.addTab(chats_tab, "Chats")
+
+        files_tab = QWidget()
+        files_layout = QVBoxLayout(files_tab)
+        files_layout.setContentsMargins(0, 0, 0, 0)
+        files_layout.setSpacing(8)
+
+        self._file_root_label = QLabel()
+        self._file_root_label.setObjectName("fileRootLabel")
+        self._file_root_label.setWordWrap(True)
+        files_layout.addWidget(self._file_root_label)
+
+        self._file_model = QFileSystemModel(self)
+        self._file_model.setFilter(
+            QDir.Filter.AllEntries | QDir.Filter.NoDotAndDotDot | QDir.Filter.Hidden
+        )
+
+        self._file_tree = QTreeView()
+        self._file_tree.setObjectName("fileExplorer")
+        self._file_tree.setModel(self._file_model)
+        self._file_tree.setAnimated(True)
+        self._file_tree.setHeaderHidden(True)
+        self._file_tree.setSortingEnabled(True)
+        self._file_tree.doubleClicked.connect(self._open_file_from_index)
+        for column in (1, 2, 3):
+            self._file_tree.hideColumn(column)
+        files_layout.addWidget(self._file_tree, 1)
+        self._sidebar_tabs.addTab(files_tab, "Files")
+        self._refresh_file_tree_root()
 
         # Centre — chat area + composer
         chat_panel = QWidget()
@@ -459,6 +548,47 @@ class MainWindow(QMainWindow):
             QListWidget#conversationList::item:selected {
                 background: rgba(239, 200, 211, 0.95);
                 color: #5a3944;
+            }
+            QTabWidget#sidebarTabs::pane {
+                border: 1px solid rgba(193, 142, 156, 0.22);
+                border-radius: 16px;
+                background: rgba(255, 252, 253, 0.65);
+                margin-top: 8px;
+            }
+            QTabWidget#sidebarTabs QTabBar::tab {
+                color: #7a5561;
+                background: rgba(255, 239, 244, 0.8);
+                border: 1px solid rgba(193, 142, 156, 0.28);
+                border-bottom: none;
+                border-top-left-radius: 12px;
+                border-top-right-radius: 12px;
+                padding: 6px 12px;
+                margin-right: 4px;
+                font-weight: 600;
+            }
+            QTabWidget#sidebarTabs QTabBar::tab:selected {
+                background: rgba(255, 250, 251, 0.96);
+                color: #5a3944;
+            }
+            QLabel#fileRootLabel {
+                color: #8a6070;
+                font-size: 11px;
+                font-family: Consolas, monospace;
+                padding: 2px 4px 0 4px;
+            }
+            QTreeView#fileExplorer {
+                background: rgba(255, 252, 253, 0.82);
+                border: 1px solid rgba(193, 142, 156, 0.24);
+                border-radius: 14px;
+                padding: 6px;
+                outline: none;
+                color: #664852;
+                selection-background-color: rgba(239, 200, 211, 0.95);
+                selection-color: #5a3944;
+            }
+            QTreeView#fileExplorer::item {
+                padding: 4px 6px;
+                border-radius: 8px;
             }
             QWidget#chatAreaFrame {
                 background-color: #f8e9ee;
@@ -790,7 +920,8 @@ class MainWindow(QMainWindow):
         if self.thinking:
             QMessageBox.information(self, "Busy", "Wait for the response to finish.")
             return
-        SettingsDialog(self).exec()
+        if SettingsDialog(self).exec():
+            self._refresh_file_tree_root()
         self._refresh_status()
 
     # ── Context compaction ────────────────────────────────────────────────
@@ -1301,6 +1432,10 @@ class MainWindow(QMainWindow):
     # ── Close ─────────────────────────────────────────────────────────────
 
     def closeEvent(self, event: QCloseEvent):  # noqa: N802
+        for window in list(self._editor_windows):
+            if not window.close():
+                event.ignore()
+                return
         self._cancel_event.set()
         self._log_stop.set()
         if self._stream_thread is not None:

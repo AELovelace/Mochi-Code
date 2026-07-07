@@ -55,7 +55,17 @@ class SettingsDialog(QDialog):
         ti = s.get("titler", {})
         br = s.get("brave", {})
         lv = s.get("lovense", {})
+        rg = s.get("rag", {})
         df = DEFAULT_SETTINGS
+        df_rg = df["rag"]
+
+        # ── RAG ─────────────────────────────────────────────────────────
+        self.rag_device    = _line(rg.get("device",          df_rg["device"]))
+        self.rag_embed     = _line(rg.get("embedding_model", df_rg["embedding_model"]))
+        self.rag_rerank    = _line(rg.get("reranker_model",  df_rg["reranker_model"]))
+        self.rag_batch     = _line(str(rg.get("batch_size",      df_rg["batch_size"])))
+        self.rag_top_k_ret = _line(str(rg.get("top_k_retrieve",  df_rg["top_k_retrieve"])))
+        self.rag_top_k_rer = _line(str(rg.get("top_k_rerank",    df_rg["top_k_rerank"])))
 
         # ── Agent ────────────────────────────────────────────────────────
         self.agent_addr   = _line(ag.get("address",       df["agent"]["address"]))
@@ -149,6 +159,14 @@ class SettingsDialog(QDialog):
             ("Reward toy (toy 2)", reward_row),
             ("",               refresh_btn),
         ]), "Lovense")
+        tabs.addTab(_tab([
+            ("Device (cpu / cuda / mps)", self.rag_device),
+            ("Embedding model",           self.rag_embed),
+            ("Reranker model",            self.rag_rerank),
+            ("Embed batch size",          self.rag_batch),
+            ("Top-K retrieve",            self.rag_top_k_ret),
+            ("Top-K rerank",              self.rag_top_k_rer),
+        ]), "RAG")
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -216,6 +234,17 @@ class SettingsDialog(QDialog):
         SETTINGS["lovense"]["key_file"]      = self.lv_key.text().strip()
         SETTINGS["lovense"]["heat_toy"]      = self.lv_heat_combo.currentData() or ""
         SETTINGS["lovense"]["reward_toy"]    = self.lv_reward_combo.currentData() or ""
+
+        SETTINGS.setdefault("rag", {})
+        SETTINGS["rag"]["device"]          = self.rag_device.text().strip()
+        SETTINGS["rag"]["embedding_model"] = self.rag_embed.text().strip()
+        SETTINGS["rag"]["reranker_model"]  = self.rag_rerank.text().strip()
+        try:
+            SETTINGS["rag"]["batch_size"]     = int(self.rag_batch.text().strip() or 32)
+            SETTINGS["rag"]["top_k_retrieve"] = int(self.rag_top_k_ret.text().strip() or 20)
+            SETTINGS["rag"]["top_k_rerank"]   = int(self.rag_top_k_rer.text().strip() or 5)
+        except ValueError:
+            pass
 
         save_settings(SETTINGS)
         rebuild_llms()

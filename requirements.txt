@@ -4,6 +4,10 @@ langgraph-checkpoint-sqlite
 windows-curses; sys_platform == "win32"
 PyQt6
 
+# PyTorch with CUDA 12.1 — install via the PyTorch index so pip pulls the GPU wheel.
+# Run: pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121
+torch --extra-index-url https://download.pytorch.org/whl/cu121
+
 # Hybrid RAG agent (rag.py) — local indexing + dense/sparse retrieval + reranking
 langchain
 langchain-community

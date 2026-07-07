@@ -34,6 +34,17 @@ DEFAULT_SETTINGS = {
         "address": "http://100.83.3.32:9091/v1",
         "system_prompt": "",
     },
+    # RAG pipeline hardware/model configuration.
+    # device: where embeddings and reranker run — "cpu", "cuda", "cuda:0", "mps", etc.
+    # Changing embedding_model invalidates the existing index and triggers an automatic rebuild.
+    "rag": {
+        "device":          "cpu",
+        "embedding_model": "BAAI/bge-small-en-v1.5",
+        "reranker_model":  "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        "batch_size":      32,
+        "top_k_retrieve":  20,
+        "top_k_rerank":    5,
+    },
     # Lovense Standard API integration — toy connection and vibration control.
     # token / uid come from https://www.lovense.com/user/developer/info.
     # callback_port: the port this app listens on for the toy-pairing POST.
@@ -78,7 +89,7 @@ def load_settings() -> dict:
         result = json.loads(json.dumps(DEFAULT_SETTINGS))
         # Merge every known section so older settings.json files (which may pre-date
         # the researcher endpoint) still load cleanly and just pick up the new defaults.
-        for section in ("agent", "researcher", "brave", "classifier", "titler", "lovense"):
+        for section in ("agent", "researcher", "brave", "classifier", "titler", "lovense", "rag"):
             if section in data:
                 result[section].update(data[section])
         if "mode" in data and data["mode"] in ("auto", "agent", "plan", "chat"):

@@ -205,7 +205,7 @@ VIEW_HELP     = "help"
 ROLE_PAIR   = {"user": 2, "ai": 3, "router": 4, "tool": 5, "rag": 6, "thinking": 4}
 ROLE_PREFIX = {
     "user": "You: ",
-    "ai": "AI:  ",
+    "ai": "Mochi: ",
     "router": "",
     "tool": "",
     "rag": "",
@@ -238,4 +238,11 @@ F_LOVENSE_KEY       = 20
 # Per-toy assignment: toy IDs for <heat> and <reward> tags.
 F_LOVENSE_HEAT_TOY   = 21
 F_LOVENSE_REWARD_TOY = 22
-NUM_FIELDS           = 23
+# RAG pipeline hardware/model tuning.
+F_RAG_DEVICE         = 23
+F_RAG_EMBED_MODEL    = 24
+F_RAG_RERANK_MODEL   = 25
+F_RAG_BATCH_SIZE     = 26
+F_RAG_TOP_K_RETRIEVE = 27
+F_RAG_TOP_K_RERANK   = 28
+NUM_FIELDS           = 29

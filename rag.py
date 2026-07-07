@@ -272,6 +272,11 @@ class _Engine:
 
     # -- model loading ---------------------------------------------------
 
+    def _rag_cfg(self) -> dict:
+        """Return the live RAG settings, falling back to module-level defaults."""
+        from settings import SETTINGS
+        return SETTINGS.get("rag", {})
+
     def _load_models(self):
         """Load the embedding + reranker models (first use only)."""
         from langchain_huggingface import HuggingFaceEmbeddings
@@ -283,15 +288,35 @@ class _Engine:
         except ImportError:
             from langchain.retrievers.document_compressors import CrossEncoderReranker
 
+        cfg        = self._rag_cfg()
+        device     = cfg.get("device",          "cpu")
+        embed_name = cfg.get("embedding_model", EMBED_MODEL)
+        rerank_name= cfg.get("reranker_model",  RERANK_MODEL)
+        batch_size = int(cfg.get("batch_size",  32))
+        top_rerank = int(cfg.get("top_k_rerank", RERANK_TOP_N))
+
         if self.embeddings is None:
             # normalize_embeddings=True pairs well with cosine distance.
-            self.embeddings = HuggingFaceEmbeddings(
-                model_name=EMBED_MODEL,
-                encode_kwargs={"normalize_embeddings": True},
-            )
+            # Fall back to CPU if the requested device isn't available (e.g. CUDA not compiled in).
+            try:
+                self.embeddings = HuggingFaceEmbeddings(
+                    model_name=embed_name,
+                    model_kwargs={"device": device},
+                    encode_kwargs={"normalize_embeddings": True, "batch_size": batch_size},
+                )
+            except (AssertionError, RuntimeError, ValueError):
+                self.embeddings = HuggingFaceEmbeddings(
+                    model_name=embed_name,
+                    model_kwargs={"device": "cpu"},
+                    encode_kwargs={"normalize_embeddings": True, "batch_size": batch_size},
+                )
         if self.reranker is None:
-            ce = HuggingFaceCrossEncoder(model_name=RERANK_MODEL)
-            self.reranker = CrossEncoderReranker(model=ce, top_n=RERANK_TOP_N)
+            # device is passed via model_kwargs so the underlying CrossEncoder picks it up.
+            try:
+                ce = HuggingFaceCrossEncoder(model_name=rerank_name, model_kwargs={"device": device})
+            except (AssertionError, RuntimeError, ValueError):
+                ce = HuggingFaceCrossEncoder(model_name=rerank_name, model_kwargs={"device": "cpu"})
+            self.reranker = CrossEncoderReranker(model=ce, top_n=top_rerank)
 
     # -- corpus scanning -------------------------------------------------
 
@@ -353,6 +378,10 @@ class _Engine:
                 meta = json.load(f)
             if meta.get("signature") != signature:
                 return False  # corpus changed since last index → force rebuild
+            cfg = self._rag_cfg()
+            current_embed = cfg.get("embedding_model", EMBED_MODEL)
+            if meta.get("embed_model", EMBED_MODEL) != current_embed:
+                return False  # embedding model changed → vectors have different dims, must rebuild
 
             from langchain_core.documents import Document
             self.parents = meta.get("parents", {})
@@ -467,8 +496,10 @@ class _Engine:
 
     def _persist(self, signature: str):
         """Save children + parents + signature so we can reload without re-embedding."""
+        cfg = self._rag_cfg()
         meta = {
-            "signature": signature,
+            "signature":    signature,
+            "embed_model":  cfg.get("embedding_model", EMBED_MODEL),
             "parents": self.parents,
             "children": [
                 {"page_content": d.page_content, "metadata": d.metadata}
@@ -490,18 +521,27 @@ class _Engine:
                 return "", []
             self._load_models()
 
+            cfg        = self._rag_cfg()
+            top_k_ret  = int(cfg.get("top_k_retrieve", RETRIEVE_K))
+            top_k_rer  = int(cfg.get("top_k_rerank",   RERANK_TOP_N))
+
+            # Keep bm25.k in sync with the live setting.
+            if self.bm25 is not None:
+                self.bm25.k = top_k_ret
+
             # 1) HYBRID RETRIEVAL — dense + sparse, fused with RRF.
-            dense_docs = self.vectorstore.similarity_search(query, k=RETRIEVE_K)
+            dense_docs = self.vectorstore.similarity_search(query, k=top_k_ret)
             sparse_docs = self.bm25.invoke(query) if self.bm25 else []
-            fused = _rrf_fuse([dense_docs, sparse_docs], top=RETRIEVE_K)
+            fused = _rrf_fuse([dense_docs, sparse_docs], top=top_k_ret)
             if not fused:
                 return "", []
 
             # 2) RERANK — cross-encoder scores query↔chunk pairs, keep best N.
             try:
+                self.reranker.top_n = top_k_rer
                 reranked = self.reranker.compress_documents(fused, query)
             except Exception:
-                reranked = fused[:RERANK_TOP_N]
+                reranked = fused[:top_k_rer]
 
             # 3) SMALL-TO-BIG — replace each tiny matched chunk with its parent
             #    section, preserving rank order and dropping duplicate parents.
